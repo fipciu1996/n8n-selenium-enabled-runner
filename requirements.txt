@@ -1,0 +1,7 @@
+loguru
+python-gitlab
+requests
+selenium
+webdriver-manager
+pandas
+numpy
