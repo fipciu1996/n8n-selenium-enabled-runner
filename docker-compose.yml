@@ -66,10 +66,6 @@ services:
       dockerfile: Dockerfile
     image: n8n-runners-test:latest
     restart: always
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - seccomp:unconfined
     shm_size: "1gb"
     environment:
       - N8N_RUNNERS_TASK_BROKER_URI=http://n8n:5679
