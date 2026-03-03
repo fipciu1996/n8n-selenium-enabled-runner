@@ -1,7 +1,63 @@
+ARG NODE_VERSION=24.13.1
 ARG PYTHON_VERSION=3.13
+ARG N8N_GIT_REF=latest
 
 # ==============================================================================
-# STAGE 1: Python runner build (@n8n/task-runner-python) with uv
+# STAGE 0: Clone n8n sources
+# ==============================================================================
+FROM alpine:3.22.1 AS n8n-source
+ARG N8N_GIT_REF
+
+RUN apk add --no-cache git ca-certificates
+RUN set -e; \
+  REPO_URL="https://github.com/n8n-io/n8n.git"; \
+  if [ "${N8N_GIT_REF}" = "latest" ]; then \
+    LATEST_TAG="$(git ls-remote --tags --refs "${REPO_URL}" \
+      | awk '{print $2}' \
+      | sed 's#refs/tags/##' \
+      | grep -E '^n8n@' \
+      | sort -V \
+      | tail -n 1)"; \
+    echo "Latest n8n tag is ${LATEST_TAG}"; \
+    git clone --depth 1 --branch "${LATEST_TAG}" "${REPO_URL}" /src/n8n; \
+  else \
+    git clone --depth 1 --branch "${N8N_GIT_REF}" "${REPO_URL}" /src/n8n; \
+  fi
+
+# ==============================================================================
+# STAGE 1: JavaScript runner (@n8n/task-runner) build from source
+# ==============================================================================
+FROM node:${NODE_VERSION}-alpine AS javascript-runner-builder
+
+COPY --from=n8n-source /src/n8n /src/n8n
+WORKDIR /src/n8n
+
+RUN corepack enable pnpm
+RUN pnpm --filter @n8n/task-runner... install --frozen-lockfile
+RUN pnpm --filter @n8n/task-runner... run build
+RUN pnpm --filter @n8n/task-runner deploy --prod /app/task-runner-javascript
+
+WORKDIR /app/task-runner-javascript
+# Remove `catalog` and `workspace` references from package.json to allow `pnpm add` in extended images
+RUN node -e "const pkg = require('./package.json'); \
+  Object.keys(pkg.dependencies || {}).forEach(k => { \
+    const val = pkg.dependencies[k]; \
+    if (val === 'catalog:' || val.startsWith('catalog:') || val.startsWith('workspace:')) \
+    delete pkg.dependencies[k]; \
+  }); \
+  Object.keys(pkg.devDependencies || {}).forEach(k => { \
+    const val = pkg.devDependencies[k]; \
+    if (val === 'catalog:' || val.startsWith('catalog:') || val.startsWith('workspace:')) \
+    delete pkg.devDependencies[k]; \
+  }); \
+  delete pkg.devDependencies; \
+  require('fs').writeFileSync('./package.json', JSON.stringify(pkg, null, 2));"
+# Install moment (special case for backwards compatibility)
+RUN rm -f node_modules/.modules.yaml && \
+  pnpm add moment@2.30.1 --prod --no-lockfile
+
+# ==============================================================================
+# STAGE 2: Python runner build (@n8n/task-runner-python) with uv
 # Produces a relocatable venv tied to the python version used
 # ==============================================================================
 FROM python:${PYTHON_VERSION}-alpine AS python-runner-builder
@@ -24,9 +80,9 @@ RUN set -e; \
 
 WORKDIR /app/task-runner-python
 
-COPY sources/n8n/packages/@n8n/task-runner-python/pyproject.toml \
-     sources/n8n/packages/@n8n/task-runner-python/uv.lock** \
-     sources/n8n/packages/@n8n/task-runner-python/.python-version** \
+COPY --from=n8n-source /src/n8n/packages/@n8n/task-runner-python/pyproject.toml \
+     /src/n8n/packages/@n8n/task-runner-python/uv.lock** \
+     /src/n8n/packages/@n8n/task-runner-python/.python-version** \
      ./
 COPY requirements.txt /workdir/requirements.txt
 
@@ -38,8 +94,8 @@ RUN uv sync \
       --no-dev \
       --all-extras
 
-COPY sources/n8n/packages/@n8n/task-runner-python/README.md ./README.md
-COPY sources/n8n/packages/@n8n/task-runner-python/src ./src
+COPY --from=n8n-source /src/n8n/packages/@n8n/task-runner-python/README.md ./README.md
+COPY --from=n8n-source /src/n8n/packages/@n8n/task-runner-python/src ./src
 RUN uv sync \
       --frozen \
       --no-dev \
@@ -53,7 +109,7 @@ RUN uv pip install -r /workdir/requirements.txt
 RUN uv pip install . && rm -rf /app/task-runner-python/src
 
 # ==============================================================================
-# STAGE 2: Task Runner Launcher download
+# STAGE 3: Task Runner Launcher download
 # ==============================================================================
 FROM alpine:3.22.1 AS launcher-downloader
 ARG TARGETPLATFORM
@@ -75,7 +131,12 @@ RUN set -e; \
     cd / && rm -rf /launcher-temp
 
 # ==============================================================================
-# STAGE 3: Runtime
+# STAGE 4: Node alpine base for JS task runner
+# ==============================================================================
+FROM node:${NODE_VERSION}-alpine AS node-alpine
+
+# ==============================================================================
+# STAGE 5: Runtime
 # ==============================================================================
 FROM python:${PYTHON_VERSION}-alpine AS runtime
 ARG N8N_VERSION=snapshot
@@ -88,12 +149,14 @@ ENV NODE_ENV=production \
 # Bring `uv` over from python-runner-builder, to make the image easier to extend
 COPY --from=python-runner-builder /usr/local/bin/uv /usr/local/bin/uv
 
+# libstdc++ is required by Node
 # libc6-compat is required by task-runner-launcher
 # Keep apk-tools installed for troubleshooting and later extensions.
 # Add Chromium and dependencies for Selenium-based web scraping.
 RUN apk add --no-cache \
     ca-certificates \
     tini \
+    libstdc++ \
     libc6-compat \
     chromium \
     chromium-chromedriver \
@@ -119,6 +182,12 @@ RUN addgroup -g 1000 -S runner \
 
 WORKDIR /home/runner
 
+COPY --from=node-alpine /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-alpine /usr/local/lib/node_modules/corepack /usr/local/lib/node_modules/corepack
+RUN ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
+ && ln -s ../lib/node_modules/corepack/dist/pnpm.js /usr/local/bin/pnpm
+
+COPY --from=javascript-runner-builder --chown=root:root /app/task-runner-javascript /opt/runners/task-runner-javascript
 COPY --from=python-runner-builder --chown=root:root /app/task-runner-python /opt/runners/task-runner-python
 COPY --from=launcher-downloader /launcher-bin/* /usr/local/bin/
 COPY --chown=root:root n8n-task-runners.json /etc/n8n-task-runners.json
@@ -127,10 +196,10 @@ USER runner
 
 EXPOSE 5680/tcp
 ENTRYPOINT ["tini", "--", "/usr/local/bin/task-runner-launcher"]
-CMD ["python"]
+CMD ["javascript", "python"]
 
 LABEL org.opencontainers.image.title="n8n task runners" \
-      org.opencontainers.image.description="Sidecar image providing n8n task runners for Python code execution" \
+      org.opencontainers.image.description="Sidecar image providing n8n task runners for JavaScript and Python code execution" \
       org.opencontainers.image.source="https://github.com/n8n-io/n8n" \
       org.opencontainers.image.url="https://n8n.io" \
       org.opencontainers.image.version="${N8N_VERSION}"
